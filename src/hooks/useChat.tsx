@@ -9,6 +9,7 @@ export interface Message {
   text: string;
   sender: "me" | "stranger";
   timestamp: number;
+  system?: boolean;
 }
 
 export type ChatStatus = "idle" | "searching" | "chatting" | "disconnected";
@@ -104,7 +105,7 @@ export function useChat() {
         sender: "stranger", 
         timestamp: Date.now(),
         system: true 
-      } as Message & { system?: boolean },
+      } as Message,
     ]);
   }, []);
   
@@ -116,19 +117,28 @@ export function useChat() {
     
     try {
       // Check for any available room with one participant
-      const { data: rooms } = await supabase
+      // Use a different approach instead of .group() which doesn't exist
+      const { data: participants } = await supabase
         .from('chat_participants')
-        .select('room_id, count(*)')
-        .neq('user_id', userId)
-        .group('room_id')
-        .having('count(*) = 1')
-        .limit(1);
+        .select('room_id, user_id')
+        .neq('user_id', userId);
+        
+      // Count participants per room and find rooms with exactly one participant
+      const roomCounts: Record<string, number> = {};
+      participants?.forEach(p => {
+        if (p.room_id) {
+          roomCounts[p.room_id] = (roomCounts[p.room_id] || 0) + 1;
+        }
+      });
+      
+      // Find the first room with exactly 1 participant
+      const availableRoomId = Object.keys(roomCounts).find(id => roomCounts[id] === 1);
       
       let newRoomId;
       
-      if (rooms && rooms.length > 0) {
+      if (availableRoomId) {
         // Join existing room
-        newRoomId = rooms[0].room_id;
+        newRoomId = availableRoomId;
         
         await supabase
           .from('chat_participants')
