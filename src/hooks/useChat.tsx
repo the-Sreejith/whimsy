@@ -3,74 +3,41 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { toast } from "@/components/ui/use-toast";
 import { v4 as uuidv4 } from "uuid";
 import { supabase } from "@/integrations/supabase/client";
+import { ChatStatus } from "@/types/chat";
+import { useChatRoom } from "@/hooks/useChatRoom";
+import { useMessages } from "@/hooks/useMessages";
+import { chatService } from "@/services/chatService";
 
-export interface Message {
-  id: string;
-  text: string;
-  sender: "me" | "stranger";
-  timestamp: number;
-  system?: boolean;
-}
-
-export type ChatStatus = "idle" | "searching" | "chatting" | "disconnected";
+export { type ChatStatus } from "@/types/chat";
+export { type Message } from "@/types/chat";
 
 export function useChat() {
   const [status, setStatus] = useState<ChatStatus>("idle");
-  const [messages, setMessages] = useState<Message[]>([]);
   const [isTyping, setIsTyping] = useState(false);
   const [roomId, setRoomId] = useState<string | null>(null);
   const [userId, setUserId] = useState<string>(uuidv4());
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const channelRef = useRef<any>(null);
-  const presenceChannelRef = useRef<any>(null);
   
-  // Set up listeners for room changes
-  const setupRoomListeners = useCallback(async (roomId: string) => {
-    // Clean up any existing channel subscription
-    if (channelRef.current) {
-      await supabase.removeChannel(channelRef.current);
+  const { messages, addMessage, addSystemMessage, clearMessages } = useMessages();
+  
+  const handleMessageReceived = useCallback((text: string, sender: "stranger") => {
+    addMessage(text, sender);
+    setIsTyping(false);
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
     }
-    
-    // Subscribe to chat messages
-    channelRef.current = supabase
-      .channel(`room:${roomId}`)
-      .on('postgres_changes', 
-        { 
-          event: 'INSERT', 
-          schema: 'public', 
-          table: 'chat_messages',
-          filter: `room_id=eq.${roomId}`
-        }, 
-        (payload) => {
-          if (payload.new && payload.new.sender_id !== userId) {
-            addMessage(payload.new.message, "stranger");
-            setIsTyping(false);
-            if (typingTimeoutRef.current) {
-              clearTimeout(typingTimeoutRef.current);
-            }
-          }
-        }
-      )
-      .subscribe();
-      
-    // Set up presence channel for typing indicators
-    if (presenceChannelRef.current) {
-      await supabase.removeChannel(presenceChannelRef.current);
-    }
-    
-    presenceChannelRef.current = supabase
-      .channel(`presence:${roomId}`)
-      .on('presence', { event: 'sync' }, () => {
-        const state = presenceChannelRef.current?.presenceState() || {};
-        const strangersState = Object.values(state).flat().filter((p: any) => 
-          p.user_id !== userId && p.room_id === roomId
-        );
-        
-        const someoneTyping = strangersState.some((p: any) => p.isTyping);
-        setIsTyping(someoneTyping);
-      })
-      .subscribe();
-  }, [userId]);
+  }, [addMessage]);
+
+  const handleTypingChange = useCallback((isTyping: boolean) => {
+    setIsTyping(isTyping);
+  }, []);
+  
+  const { setupRoomListeners, cleanup, sendTypingIndicator } = useChatRoom(
+    userId,
+    roomId,
+    handleMessageReceived,
+    handleTypingChange
+  );
   
   // Clean up channels on unmount
   useEffect(() => {
@@ -78,61 +45,19 @@ export function useChat() {
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
       }
-      
-      if (channelRef.current) {
-        supabase.removeChannel(channelRef.current);
-      }
-      
-      if (presenceChannelRef.current) {
-        supabase.removeChannel(presenceChannelRef.current);
-      }
+      cleanup();
     };
-  }, []);
-  
-  const addMessage = useCallback((text: string, sender: "me" | "stranger") => {
-    setMessages((prev) => [
-      ...prev,
-      { id: uuidv4(), text, sender, timestamp: Date.now() },
-    ]);
-  }, []);
-  
-  const addSystemMessage = useCallback((text: string) => {
-    setMessages((prev) => [
-      ...prev,
-      { 
-        id: uuidv4(), 
-        text, 
-        sender: "stranger", 
-        timestamp: Date.now(),
-        system: true 
-      } as Message,
-    ]);
-  }, []);
+  }, [cleanup]);
   
   // Find a chat partner
   const startChat = useCallback(async () => {
     setStatus("searching");
-    setMessages([]);
+    clearMessages();
     addSystemMessage("Looking for someone to chat with...");
     
     try {
       // Check for any available room with one participant
-      // Use a different approach instead of .group() which doesn't exist
-      const { data: participants } = await supabase
-        .from('chat_participants')
-        .select('room_id, user_id')
-        .neq('user_id', userId);
-        
-      // Count participants per room and find rooms with exactly one participant
-      const roomCounts: Record<string, number> = {};
-      participants?.forEach(p => {
-        if (p.room_id) {
-          roomCounts[p.room_id] = (roomCounts[p.room_id] || 0) + 1;
-        }
-      });
-      
-      // Find the first room with exactly 1 participant
-      const availableRoomId = Object.keys(roomCounts).find(id => roomCounts[id] === 1);
+      const availableRoomId = await chatService.findAvailableRoom(userId);
       
       let newRoomId;
       
@@ -140,45 +65,34 @@ export function useChat() {
         // Join existing room
         newRoomId = availableRoomId;
         
-        await supabase
-          .from('chat_participants')
-          .insert({
-            room_id: newRoomId,
-            user_id: userId
-          });
+        const joined = await chatService.joinRoom(newRoomId, userId);
+        if (!joined) {
+          throw new Error("Failed to join room");
+        }
         
         // Add system message in the database
-        await supabase
-          .from('chat_messages')
-          .insert({
-            room_id: newRoomId,
-            sender_id: 'system',
-            message: 'A stranger has joined the chat.',
-            is_system: true
-          });
+        await chatService.sendMessage(
+          newRoomId,
+          userId,
+          'A stranger has joined the chat.',
+          true
+        );
           
       } else {
         // Create a new room
-        const { data: newRoom } = await supabase
-          .from('chat_rooms')
-          .insert({})
-          .select()
-          .single();
-          
-        if (newRoom) {
-          newRoomId = newRoom.id;
-          
-          // Add user to room
-          await supabase
-            .from('chat_participants')
-            .insert({
-              room_id: newRoomId,
-              user_id: userId
-            });
-            
-          addSystemMessage("Waiting for someone to join...");
-          setStatus("searching");
+        newRoomId = await chatService.createNewRoom();
+        if (!newRoomId) {
+          throw new Error("Failed to create new room");
         }
+          
+        // Add user to room
+        const joined = await chatService.joinRoom(newRoomId, userId);
+        if (!joined) {
+          throw new Error("Failed to join room");
+        }
+            
+        addSystemMessage("Waiting for someone to join...");
+        setStatus("searching");
       }
       
       if (newRoomId) {
@@ -222,7 +136,7 @@ export function useChat() {
       });
       setStatus("idle");
     }
-  }, [userId, addSystemMessage, setupRoomListeners]);
+  }, [userId, addSystemMessage, setupRoomListeners, clearMessages]);
   
   // Send a message
   const sendMessage = useCallback(async (text: string) => {
@@ -233,13 +147,7 @@ export function useChat() {
       addMessage(text, "me");
       
       // Send to database
-      await supabase
-        .from('chat_messages')
-        .insert({
-          room_id: roomId,
-          sender_id: userId,
-          message: text
-        });
+      await chatService.sendMessage(roomId, userId, text);
       
     } catch (error) {
       console.error("Error sending message:", error);
@@ -251,55 +159,30 @@ export function useChat() {
     }
   }, [roomId, userId, addMessage]);
   
-  // Send typing indicator
-  const sendTyping = useCallback((isTyping: boolean) => {
-    if (!roomId || !presenceChannelRef.current) return;
-    
-    presenceChannelRef.current.track({
-      user_id: userId,
-      room_id: roomId,
-      isTyping
-    });
-  }, [roomId, userId]);
-  
   // Find new chat partner
   const nextChat = useCallback(async () => {
     if (roomId) {
       // Leave current room
       try {
-        await supabase
-          .from('chat_messages')
-          .insert({
-            room_id: roomId,
-            sender_id: 'system',
-            message: 'Stranger has disconnected.',
-            is_system: true
-          });
+        await chatService.sendMessage(
+          roomId,
+          userId,
+          'Stranger has disconnected.',
+          true
+        );
           
-        await supabase
-          .from('chat_participants')
-          .delete()
-          .eq('user_id', userId)
-          .eq('room_id', roomId);
+        await chatService.leaveRoom(roomId, userId);
       } catch (error) {
         console.error("Error leaving chat:", error);
       }
     }
     
     // Clean up channels
-    if (channelRef.current) {
-      await supabase.removeChannel(channelRef.current);
-      channelRef.current = null;
-    }
-    
-    if (presenceChannelRef.current) {
-      await supabase.removeChannel(presenceChannelRef.current);
-      presenceChannelRef.current = null;
-    }
+    await cleanup();
     
     setRoomId(null);
     startChat();
-  }, [roomId, userId, startChat]);
+  }, [roomId, userId, startChat, cleanup]);
   
   // End chat
   const endChat = useCallback(async () => {
@@ -307,32 +190,18 @@ export function useChat() {
     
     try {
       // Add system message about disconnection
-      await supabase
-        .from('chat_messages')
-        .insert({
-          room_id: roomId,
-          sender_id: 'system',
-          message: 'Stranger has disconnected.',
-          is_system: true
-        });
+      await chatService.sendMessage(
+        roomId,
+        userId,
+        'Stranger has disconnected.',
+        true
+      );
         
       // Remove participant from room
-      await supabase
-        .from('chat_participants')
-        .delete()
-        .eq('user_id', userId)
-        .eq('room_id', roomId);
+      await chatService.leaveRoom(roomId, userId);
       
       // Clean up channels
-      if (channelRef.current) {
-        await supabase.removeChannel(channelRef.current);
-        channelRef.current = null;
-      }
-      
-      if (presenceChannelRef.current) {
-        await supabase.removeChannel(presenceChannelRef.current);
-        presenceChannelRef.current = null;
-      }
+      await cleanup();
       
       setStatus("disconnected");
       setRoomId(null);
@@ -345,7 +214,7 @@ export function useChat() {
         variant: "destructive",
       });
     }
-  }, [roomId, userId, addSystemMessage]);
+  }, [roomId, userId, addSystemMessage, cleanup]);
 
   return {
     status,
@@ -353,7 +222,7 @@ export function useChat() {
     isTyping,
     startChat,
     sendMessage,
-    sendTyping,
+    sendTyping: sendTypingIndicator,
     nextChat,
     endChat
   };

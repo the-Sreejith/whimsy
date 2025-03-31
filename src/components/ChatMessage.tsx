@@ -1,5 +1,4 @@
-
-import { Message } from "@/hooks/useChat";
+import { Message } from "@/types/chat";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 
