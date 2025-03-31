@@ -17,6 +17,7 @@ export function useChat() {
   const [roomId, setRoomId] = useState<string | null>(null);
   const [userId, setUserId] = useState<string>(uuidv4());
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const participantChannelRef = useRef<any>(null);
   
   const { messages, addMessage, addSystemMessage, clearMessages } = useMessages();
   
@@ -45,9 +46,48 @@ export function useChat() {
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
       }
+      cleanupSubscriptions();
       cleanup();
     };
   }, [cleanup]);
+
+  const cleanupSubscriptions = useCallback(async () => {
+    // Clean up participant channel if exists
+    if (participantChannelRef.current) {
+      await supabase.removeChannel(participantChannelRef.current);
+      participantChannelRef.current = null;
+    }
+  }, []);
+  
+  // Set up participant channel to listen for changes
+  const setupParticipantListener = useCallback((newRoomId: string) => {
+    // Clean up existing channel if any
+    if (participantChannelRef.current) {
+      supabase.removeChannel(participantChannelRef.current);
+    }
+    
+    const channel = supabase
+      .channel(`participants:${newRoomId}`)
+      .on('postgres_changes', 
+        { 
+          event: 'INSERT', 
+          schema: 'public', 
+          table: 'chat_participants',
+          filter: `room_id=eq.${newRoomId}`
+        }, 
+        async () => {
+          // Check participant count
+          const count = await chatService.getRoomParticipantsCount(newRoomId);
+          if (count >= 2 && status === "searching") {
+            setStatus("chatting");
+            addSystemMessage("You are now chatting with a stranger!");
+          }
+        }
+      )
+      .subscribe();
+      
+    participantChannelRef.current = channel;
+  }, [status, addSystemMessage]);
   
   // Find a chat partner
   const startChat = useCallback(async () => {
@@ -77,6 +117,10 @@ export function useChat() {
           'A stranger has joined the chat.',
           true
         );
+        
+        // Since we're joining an existing room with 1 participant, we can set status to chatting
+        setStatus("chatting");
+        addSystemMessage("You are now chatting with a stranger!");
           
       } else {
         // Create a new room
@@ -98,34 +142,7 @@ export function useChat() {
       if (newRoomId) {
         setRoomId(newRoomId);
         setupRoomListeners(newRoomId);
-        
-        // Subscribe to participant changes to detect when someone joins
-        const participantChannel = supabase
-          .channel(`participants:${newRoomId}`)
-          .on('postgres_changes', 
-            { 
-              event: 'INSERT', 
-              schema: 'public', 
-              table: 'chat_participants',
-              filter: `room_id=eq.${newRoomId}`
-            }, 
-            async () => {
-              // Check if we have 2 participants now
-              const { data: participants } = await supabase
-                .from('chat_participants')
-                .select('user_id')
-                .eq('room_id', newRoomId);
-                
-              if (participants && participants.length >= 2) {
-                setStatus("chatting");
-                addSystemMessage("You are now chatting with a stranger!");
-                
-                // Remove this one-time listener
-                supabase.removeChannel(participantChannel);
-              }
-            }
-          )
-          .subscribe();
+        setupParticipantListener(newRoomId);
       }
     } catch (error) {
       console.error("Error starting chat:", error);
@@ -136,7 +153,7 @@ export function useChat() {
       });
       setStatus("idle");
     }
-  }, [userId, addSystemMessage, setupRoomListeners, clearMessages]);
+  }, [userId, addSystemMessage, setupRoomListeners, clearMessages, setupParticipantListener]);
   
   // Send a message
   const sendMessage = useCallback(async (text: string) => {
@@ -178,11 +195,12 @@ export function useChat() {
     }
     
     // Clean up channels
+    await cleanupSubscriptions();
     await cleanup();
     
     setRoomId(null);
     startChat();
-  }, [roomId, userId, startChat, cleanup]);
+  }, [roomId, userId, startChat, cleanup, cleanupSubscriptions]);
   
   // End chat
   const endChat = useCallback(async () => {
@@ -201,6 +219,7 @@ export function useChat() {
       await chatService.leaveRoom(roomId, userId);
       
       // Clean up channels
+      await cleanupSubscriptions();
       await cleanup();
       
       setStatus("disconnected");
@@ -214,7 +233,7 @@ export function useChat() {
         variant: "destructive",
       });
     }
-  }, [roomId, userId, addSystemMessage, cleanup]);
+  }, [roomId, userId, addSystemMessage, cleanup, cleanupSubscriptions]);
 
   return {
     status,
