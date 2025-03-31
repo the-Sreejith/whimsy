@@ -1,4 +1,3 @@
-
 import { useState, useEffect, useCallback, useRef } from "react";
 import { toast } from "@/components/ui/use-toast";
 import { v4 as uuidv4 } from "uuid";
@@ -70,24 +69,50 @@ export function useChat() {
       .channel(`participants:${newRoomId}`)
       .on('postgres_changes', 
         { 
-          event: 'INSERT', 
+          event: '*', // Listen to all operations (INSERT, UPDATE, DELETE)
           schema: 'public', 
           table: 'chat_participants',
           filter: `room_id=eq.${newRoomId}`
         }, 
-        async () => {
+        async (payload) => {
           // Check participant count
           const count = await chatService.getRoomParticipantsCount(newRoomId);
-          if (count >= 2 && status === "searching") {
+          console.log("Participant count changed:", count, "Current status:", status);
+          
+          if (count >= 2 && (status === "searching" || status === "idle")) {
+            console.log("Switching to chatting state");
             setStatus("chatting");
             addSystemMessage("You are now chatting with a stranger!");
           }
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        console.log("Participant channel status:", status);
+      });
       
     participantChannelRef.current = channel;
   }, [status, addSystemMessage]);
+
+  // Additionally listen for direct room events
+  useEffect(() => {
+    if (!roomId) return;
+    
+    // Poll periodically to check for participant count
+    const intervalId = setInterval(async () => {
+      if (roomId && status === "searching") {
+        const count = await chatService.getRoomParticipantsCount(roomId);
+        if (count >= 2) {
+          setStatus("chatting");
+          addSystemMessage("You are now chatting with a stranger!");
+          clearInterval(intervalId);
+        }
+      }
+    }, 2000); // Check every 2 seconds
+    
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [roomId, status, addSystemMessage]);
   
   // Find a chat partner
   const startChat = useCallback(async () => {
@@ -118,7 +143,7 @@ export function useChat() {
           true
         );
         
-        // Since we're joining an existing room with 1 participant, we can set status to chatting
+        // Update status to chatting immediately since we know there's already someone in the room
         setStatus("chatting");
         addSystemMessage("You are now chatting with a stranger!");
           
@@ -136,6 +161,7 @@ export function useChat() {
         }
             
         addSystemMessage("Waiting for someone to join...");
+        // Keep status as searching since we're waiting for someone to join
         setStatus("searching");
       }
       
